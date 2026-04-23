@@ -1,0 +1,6 @@
+deepface==0.0.99
+tensorflow==2.21.0
+tf-keras==2.21.0
+opencv-python==4.13.0.92
+numpy==2.4.4
+python-dotenv==1.2.2

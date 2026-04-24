@@ -1,3 +1,4 @@
+# File: recognize.py
 import hashlib
 import os
 import time
@@ -8,617 +9,530 @@ import numpy as np
 
 from database_manager import log_attendance
 
-MODEL_NAME = os.getenv("FR_MODEL_NAME", "Facenet512")
+MODEL_NAME = os.getenv("FR_MODEL_NAME", "SFace") 
 DETECTOR_BACKEND = os.getenv("FR_DETECTOR_BACKEND", "opencv")
 REPRESENT_BACKEND = os.getenv("FR_REPRESENT_BACKEND", "skip")
-COSINE_THRESHOLD = float(os.getenv("FR_COSINE_THRESHOLD", "0.33"))
-SAMPLE_THRESHOLD = float(os.getenv("FR_SAMPLE_THRESHOLD", "0.34"))
-MARGIN_THRESHOLD = float(os.getenv("FR_MARGIN_THRESHOLD", "0.03"))
+COSINE_THRESHOLD = float(os.getenv("FR_COSINE_THRESHOLD", "0.50"))
+SAMPLE_THRESHOLD = float(os.getenv("FR_SAMPLE_THRESHOLD", "0.50"))
+MARGIN_THRESHOLD = float(os.getenv("FR_MARGIN_THRESHOLD", "0.012")) 
 RECOGNIZE_EVERY_N_FRAMES = int(os.getenv("FR_RECOGNIZE_EVERY_N", "6"))
 DETECT_EVERY_N_FRAMES = int(os.getenv("FR_DETECT_EVERY_N", "1"))
 ATTENDANCE_COOLDOWN_SECS = int(os.getenv("FR_ATTENDANCE_COOLDOWN", "30"))
-PROCESS_WIDTH = int(os.getenv("FR_PROCESS_WIDTH", "320"))
+PROCESS_WIDTH = int(os.getenv("FR_PROCESS_WIDTH", "480"))  # wider = better far-face detection
 MAX_FACES_PER_FRAME = int(os.getenv("FR_MAX_FACES", "4"))
 MAX_ACTIVE_TRACKS = int(os.getenv("FR_MAX_ACTIVE_TRACKS", "8"))
-MAX_RECOGNITIONS_PER_CYCLE = int(os.getenv("FR_MAX_RECOGNITIONS_PER_CYCLE", "2"))
+MAX_RECOGNITIONS_PER_CYCLE = int(os.getenv("FR_MAX_RECOGNITIONS_PER_CYCLE", "1"))
 TRACK_MATCH_IOU = float(os.getenv("FR_TRACK_MATCH_IOU", "0.2"))
 TRACK_MAX_CENTER_DIST = float(os.getenv("FR_TRACK_MAX_CENTER_DIST", "1.25"))
 CONFIRM_STREAK = int(os.getenv("FR_CONFIRM_STREAK", "2"))
-VOTE_WINDOW = int(os.getenv("FR_VOTE_WINDOW", "6"))
-VOTE_MIN_COUNT = int(os.getenv("FR_VOTE_MIN_COUNT", str(CONFIRM_STREAK)))
-BOX_PERSIST_FRAMES = int(os.getenv("FR_BOX_PERSIST_FRAMES", "8"))
-BOX_SMOOTHING_ALPHA = float(os.getenv("FR_BOX_SMOOTHING_ALPHA", "0.55"))
-MIN_QUERY_FACE = int(os.getenv("FR_QUERY_MIN_FACE", "60"))
-MIN_QUERY_SHARPNESS = float(os.getenv("FR_QUERY_MIN_SHARPNESS", "45"))
-MIN_QUERY_BRIGHTNESS = float(os.getenv("FR_QUERY_MIN_BRIGHTNESS", "45"))
-MAX_QUERY_BRIGHTNESS = float(os.getenv("FR_QUERY_MAX_BRIGHTNESS", "210"))
-ENABLE_PROFILE_DETECT = os.getenv("FR_ENABLE_PROFILE_DETECT", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-}
-FALLBACK_DETECTOR_BACKEND = os.getenv("FR_FALLBACK_DETECTOR_BACKEND", "retinaface")
-FALLBACK_DETECT_EVERY_N_FRAMES = int(os.getenv("FR_FALLBACK_DETECT_EVERY_N", "4"))
-CACHE_VERSION = 3
+VOTE_WINDOW = int(os.getenv("FR_VOTE_WINDOW", "10"))      # wider window = more evidence required
+VOTE_MIN_COUNT = int(os.getenv("FR_VOTE_MIN_COUNT", "5")) # need clear majority (5/10) to confirm
+# Consecutive Unknown results needed to immediately revoke a confirmed identity.
+# 3 straight Unknowns = different person, don't wait.
+REVOKE_UNKNOWN_COUNT = int(os.getenv("FR_REVOKE_UNKNOWN_COUNT", "3"))
 
+# INCREASED PERSISTENCE FOR DRIVERS: Box will survive for 15 frames (~0.5 seconds) 
+# even if face is temporarily lost while turning neck.
+BOX_PERSIST_FRAMES = int(os.getenv("FR_BOX_PERSIST_FRAMES", "15"))
+BOX_SMOOTHING_ALPHA = float(os.getenv("FR_BOX_SMOOTHING_ALPHA", "0.55"))
+MIN_QUERY_FACE = int(os.getenv("FR_QUERY_MIN_FACE", "25"))       # lowered: catch far/small faces
+MIN_QUERY_SHARPNESS = float(os.getenv("FR_QUERY_MIN_SHARPNESS", "15"))  # lowered: allow slight blur at distance
+MIN_QUERY_BRIGHTNESS = float(os.getenv("FR_QUERY_MIN_BRIGHTNESS", "40"))
+MAX_QUERY_BRIGHTNESS = float(os.getenv("FR_QUERY_MAX_BRIGHTNESS", "210"))
+ENABLE_PROFILE_DETECT = os.getenv("FR_ENABLE_PROFILE_DETECT", "1").lower() in {"1", "true", "yes"}
+
+FALLBACK_DETECTOR_BACKEND = os.getenv("FR_FALLBACK_DETECTOR_BACKEND", "opencv")
+FALLBACK_DETECT_EVERY_N_FRAMES = int(os.getenv("FR_FALLBACK_DETECT_EVERY_N", "0"))
+# Minimum detection cycles a track must survive before its box is shown.
+# Eliminates split-second phantom boxes from one-frame Haar false positives.
+MIN_DETECT_AGE = int(os.getenv("FR_MIN_DETECT_AGE", "2"))
+CACHE_VERSION = 7  # bumped: augmented embeddings + TTA recognition
+
+persistent_id_map = {}
+next_persistent_id = 1
+
+def get_persistent_id(name):
+    global next_persistent_id
+    if name not in persistent_id_map:
+        persistent_id_map[name] = next_persistent_id
+        next_persistent_id += 1
+    return persistent_id_map[name]
 
 def _load_deepface():
-    # Reduce TensorFlow startup noise for cleaner production logs.
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
     from deepface import DeepFace
-
     return DeepFace
+
+def _apply_clahe(gray):
+    """
+    CLAHE before Haar detection improves detection rate under cabin / dashcam
+    lighting (shadows, glare, IR night-vision) with negligible Pi CPU cost.
+    """
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
 
 
 def _l2_normalize(vec):
     norm = float(np.linalg.norm(vec))
-    if norm == 0:
-        return vec
-    return vec / norm
-
+    return vec if norm == 0 else vec / norm
 
 def _box_iou(box_a, box_b):
     ax, ay, aw, ah = box_a
     bx, by, bw, bh = box_b
-    ax2, ay2 = ax + aw, ay + ah
-    bx2, by2 = bx + bw, by + bh
-
-    inter_x1 = max(ax, bx)
-    inter_y1 = max(ay, by)
-    inter_x2 = min(ax2, bx2)
-    inter_y2 = min(ay2, by2)
-
-    inter_w = max(0, inter_x2 - inter_x1)
-    inter_h = max(0, inter_y2 - inter_y1)
+    inter_w = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    inter_h = max(0, min(ay + ah, by + bh) - max(ay, by))
     inter_area = inter_w * inter_h
     union_area = (aw * ah) + (bw * bh) - inter_area
-    if union_area <= 0:
-        return 0.0
-    return inter_area / float(union_area)
-
+    return 0.0 if union_area <= 0 else inter_area / float(union_area)
 
 def _box_center(box):
-    x, y, w, h = box
-    return float(x + w / 2.0), float(y + h / 2.0)
-
+    return float(box[0] + box[2] / 2.0), float(box[1] + box[3] / 2.0)
 
 def _dedupe_faces(faces, iou_threshold=0.35):
-    if not faces:
-        return []
-
     faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
     deduped = []
     for face in faces:
-        if all(_box_iou(face, existing) < iou_threshold for existing in deduped):
-            deduped.append(face)
+        if all(_box_iou(face, ex) < iou_threshold for ex in deduped): deduped.append(face)
     return deduped
 
-
-def _detect_faces_multi_pose(gray, frontal_detector, profile_detector):
+def _detect_faces_multi_pose(gray, frontal_detector, profile_detector, alt_detectors=None):
+    """
+    CLAHE-enhanced multi-pose detection.
+    Runs frontal + two alt frontal cascades (fills 30-65° gap) +
+    left-profile + right-profile (mirrored) cascades.
+    """
+    enhanced = _apply_clahe(gray)
     faces = []
-    frontal = frontal_detector.detectMultiScale(
-        gray,
-        scaleFactor=1.2,
-        minNeighbors=6,
-        minSize=(70, 70),
-    )
-    for (x, y, w, h) in frontal:
+
+    # Primary frontal: scaleFactor=1.1 + smaller minSize catches far faces.
+    # minNeighbors=4 (up from 3) offsets the false-positive risk of smaller minSize.
+    for (x, y, w, h) in frontal_detector.detectMultiScale(
+            enhanced, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30)):
         faces.append((int(x), int(y), int(w), int(h)))
 
+    if alt_detectors:
+        for det in alt_detectors:
+            if not det.empty():
+                # Fine-scale alt cascades: fills 30-65° angle gap AND catches small faces
+                for (x, y, w, h) in det.detectMultiScale(
+                        enhanced, scaleFactor=1.05, minNeighbors=3, minSize=(30, 30)):
+                    faces.append((int(x), int(y), int(w), int(h)))
+
     if ENABLE_PROFILE_DETECT and not profile_detector.empty():
-        profiles_left = profile_detector.detectMultiScale(
-            gray,
-            scaleFactor=1.15,
-            minNeighbors=4,
-            minSize=(70, 70),
-        )
-        for (x, y, w, h) in profiles_left:
+        # scaleFactor=1.05 catches small/far profiles; minNeighbors=2 vs 1 reduces noise
+        for (x, y, w, h) in profile_detector.detectMultiScale(
+                enhanced, scaleFactor=1.05, minNeighbors=2, minSize=(30, 30)):
             faces.append((int(x), int(y), int(w), int(h)))
-
-        flipped = cv2.flip(gray, 1)
-        profiles_right = profile_detector.detectMultiScale(
-            flipped,
-            scaleFactor=1.15,
-            minNeighbors=4,
-            minSize=(70, 70),
-        )
-        width = gray.shape[1]
-        for (x, y, w, h) in profiles_right:
-            rx = width - x - w
-            faces.append((int(rx), int(y), int(w), int(h)))
-
+        flipped = cv2.flip(enhanced, 1)
+        for (x, y, w, h) in profile_detector.detectMultiScale(
+                flipped, scaleFactor=1.05, minNeighbors=2, minSize=(30, 30)):
+            faces.append((int(gray.shape[1] - x - w), int(y), int(w), int(h)))
     return _dedupe_faces(faces)
 
-
-def _detect_faces_fallback(DeepFace, frame_bgr):
-    try:
-        objs = DeepFace.extract_faces(
-            img_path=frame_bgr,
-            detector_backend=FALLBACK_DETECTOR_BACKEND,
-            enforce_detection=False,
-            align=False,
-        )
-        faces = []
-        for obj in objs:
-            area = obj.get("facial_area") or {}
-            x = int(area.get("x", 0))
-            y = int(area.get("y", 0))
-            w = int(area.get("w", 0))
-            h = int(area.get("h", 0))
-            if w >= 60 and h >= 60:
-                faces.append((x, y, w, h))
-        return _dedupe_faces(faces)
-    except Exception:
-        return []
-
-
 def _smooth_box(prev_box, new_box, alpha):
-    if prev_box is None:
-        return tuple(int(v) for v in new_box)
-
-    px, py, pw, ph = prev_box
-    nx, ny, nw, nh = new_box
-    sx = int(alpha * nx + (1.0 - alpha) * px)
-    sy = int(alpha * ny + (1.0 - alpha) * py)
-    sw = int(alpha * nw + (1.0 - alpha) * pw)
-    sh = int(alpha * nh + (1.0 - alpha) * ph)
-    return sx, sy, sw, sh
-
+    if prev_box is None: return tuple(int(v) for v in new_box)
+    return tuple(int(alpha * n + (1.0 - alpha) * p) for p, n in zip(prev_box, new_box))
 
 def _face_quality(face_bgr):
     gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
     sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     brightness = float(np.mean(gray))
-    good = (
-        sharpness >= MIN_QUERY_SHARPNESS
-        and MIN_QUERY_BRIGHTNESS <= brightness <= MAX_QUERY_BRIGHTNESS
-    )
+    good = (sharpness >= MIN_QUERY_SHARPNESS and MIN_QUERY_BRIGHTNESS <= brightness <= MAX_QUERY_BRIGHTNESS)
     return sharpness, brightness, good
 
 
-def _iter_database_images(database_dir):
-    if not os.path.isdir(database_dir):
-        return []
+def _prepare_face_for_embedding(face_bgr):
+    """
+    Normalize a face crop to 112×112 (SFace native resolution) with
+    CLAHE equalization on the luminance channel.
 
-    image_paths = []
-    for user in sorted(os.listdir(database_dir)):
-        user_dir = os.path.join(database_dir, user)
-        if not os.path.isdir(user_dir):
-            continue
-        for img in sorted(os.listdir(user_dir)):
-            path = os.path.join(user_dir, img)
-            if os.path.isfile(path):
-                image_paths.append((user, path))
-    return image_paths
+    Must be applied identically during BOTH registration (saving) and
+    recognition (querying) so embeddings are always comparable:
+    - Removes background context → model sees only facial features
+    - Scale/distance invariant regardless of how close or far the face is
+    - Lighting-robust via LAB-space equalization
+    """
+    face_112 = cv2.resize(face_bgr, (112, 112), interpolation=cv2.INTER_LINEAR)
+    lab = cv2.cvtColor(face_112, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    l_ch = clahe.apply(l_ch)
+    return cv2.cvtColor(cv2.merge([l_ch, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+
+def _augment_for_embedding(face_bgr):
+    """
+    Produce 6 augmented variants of a 112×112 face for cache enrichment.
+    Covers: lighting extremes, slight blur (far-face), and head-tilt pairs.
+    Called at cache-build time for every original image; augmented images
+    saved by register.py are used as-is and not double-augmented.
+    Returns a flat list of augmented images (no labels needed here).
+    """
+    h, w = face_bgr.shape[:2]
+    augs = []
+    # Horizontal flip
+    augs.append(cv2.flip(face_bgr, 1))
+    # Bright / dark (simulate overexposure and shadow)
+    augs.append(np.clip(face_bgr.astype(np.float32) * 1.30, 0, 255).astype(np.uint8))
+    augs.append(np.clip(face_bgr.astype(np.float32) * 0.65, 0, 255).astype(np.uint8))
+    # Gaussian blur — simulates far or out-of-focus face
+    augs.append(cv2.GaussianBlur(face_bgr, (5, 5), 1.5))
+    # Small in-plane rotations — covers head-tilt variation
+    for angle in (10, -10):
+        M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
+        augs.append(cv2.warpAffine(face_bgr, M, (w, h), borderMode=cv2.BORDER_REFLECT_101))
+    return augs
+
+
+def _get_robust_embedding(face_norm, DeepFace):
+    """
+    Test-Time Augmentation: compute embeddings for the original face plus
+    two brightness variants, then average + re-normalize.
+    The averaged embedding is more stable across lighting and sensor noise,
+    improving match confidence for far or partially lit faces.
+    """
+    variants = [
+        face_norm,
+        np.clip(face_norm.astype(np.float32) * 1.25, 0, 255).astype(np.uint8),
+        np.clip(face_norm.astype(np.float32) * 0.75, 0, 255).astype(np.uint8),
+    ]
+    embeddings = []
+    for v in variants:
+        try:
+            reps = DeepFace.represent(v, model_name=MODEL_NAME,
+                                      detector_backend=REPRESENT_BACKEND,
+                                      enforce_detection=False)
+            if reps:
+                embeddings.append(_l2_normalize(
+                    np.asarray(reps[0]["embedding"], dtype=np.float32)))
+        except Exception:
+            pass
+    if not embeddings:
+        return None
+    if len(embeddings) == 1:
+        return embeddings[0].astype(np.float32)
+    return _l2_normalize(
+        np.mean(np.vstack(embeddings), axis=0)).astype(np.float32)
 
 
 def _dataset_fingerprint(image_paths):
     hasher = hashlib.sha256()
     for user, path in image_paths:
         stat = os.stat(path)
-        rel_path = os.path.relpath(path, "database")
-        hasher.update(f"{user}|{rel_path}|{stat.st_size}|{int(stat.st_mtime)}\n".encode("utf-8"))
+        hasher.update(f"{user}|{os.path.relpath(path, 'database')}|{stat.st_size}|{int(stat.st_mtime)}\n".encode("utf-8"))
     return hasher.hexdigest()
 
-
-def _load_embeddings_from_cache(cache_file, expected_fingerprint):
-    if not os.path.exists(cache_file):
-        return None, None
-
-    try:
-        data = np.load(cache_file, allow_pickle=True)
-        fingerprint = str(data["fingerprint"].item())
-        model = str(data["model_name"].item())
-        cache_version = int(data.get("cache_version", np.array(1)).item())
-        if (
-            fingerprint != expected_fingerprint
-            or model != MODEL_NAME
-            or cache_version != CACHE_VERSION
-        ):
-            return None, None
-        known_embs = data["embeddings"].astype(np.float32)
-        known_names = data["names"].tolist()
-        if known_embs.size == 0 or len(known_names) == 0:
-            return None, None
-        return known_embs, known_names
-    except Exception:
-        return None, None
-
-
-def _save_embeddings_cache(cache_file, fingerprint, known_embs, known_names):
-    np.savez_compressed(
-        cache_file,
-        cache_version=CACHE_VERSION,
-        fingerprint=fingerprint,
-        model_name=MODEL_NAME,
-        embeddings=np.asarray(known_embs, dtype=np.float32),
-        names=np.asarray(known_names, dtype=object),
-    )
-
-
 def _build_known_embeddings(database_dir):
-    image_paths = _iter_database_images(database_dir)
-    if not image_paths:
-        return np.empty((0, 0), dtype=np.float32), []
-
+    image_paths = [(u, os.path.join(database_dir, u, i)) for u in sorted(os.listdir(database_dir)) if os.path.isdir(os.path.join(database_dir, u)) for i in sorted(os.listdir(os.path.join(database_dir, u)))]
+    if not image_paths: return np.empty((0, 0), dtype=np.float32), []
+    
     fingerprint = _dataset_fingerprint(image_paths)
     cache_file = os.path.join(database_dir, ".embeddings_cache.npz")
-    cached_embs, cached_names = _load_embeddings_from_cache(cache_file, fingerprint)
-    if cached_embs is not None:
-        print(f"Loaded {len(cached_names)} embeddings from cache")
-        return cached_embs, cached_names
+    
+    if os.path.exists(cache_file):
+        try:
+            data = np.load(cache_file, allow_pickle=True)
+            if str(data["fingerprint"].item()) == fingerprint and str(data["model_name"].item()) == MODEL_NAME and int(data.get("cache_version", 1)) == CACHE_VERSION:
+                return data["embeddings"].astype(np.float32), data["names"].tolist()
+        except Exception: pass
 
     DeepFace = _load_deepface()
     known_embs, known_names = [], []
-    print("Building embedding cache...")
+    print(f"Building Pi-optimized embedding cache using {MODEL_NAME}...")
 
     for user, img_path in image_paths:
         try:
-            reps = DeepFace.represent(
-                img_path,
-                model_name=MODEL_NAME,
-                detector_backend=REPRESENT_BACKEND,
-                enforce_detection=False,
-            )
-            if not reps:
+            # Load the saved image (may be original or an aug variant saved by register.py)
+            img_bgr = cv2.imread(img_path)
+            if img_bgr is None:
                 continue
-            emb = np.asarray(reps[0]["embedding"], dtype=np.float32)
-            emb = _l2_normalize(emb).astype(np.float32)
-            known_embs.append(emb)
-            known_names.append(user)
+
+            is_original = "_aug_" not in os.path.basename(img_path)
+
+            # For originals: embed original + 6 augmented variants.
+            # For already-augmented files (saved by register.py): embed as-is.
+            variants = ([img_bgr] + _augment_for_embedding(img_bgr)) if is_original else [img_bgr]
+
+            for variant in variants:
+                reps = DeepFace.represent(variant, model_name=MODEL_NAME,
+                                          detector_backend=REPRESENT_BACKEND,
+                                          enforce_detection=False)
+                if reps:
+                    known_embs.append(
+                        _l2_normalize(np.asarray(reps[0]["embedding"],
+                                                 dtype=np.float32)).astype(np.float32))
+                    known_names.append(user)
         except Exception:
             continue
 
-    if not known_embs:
-        return np.empty((0, 0), dtype=np.float32), []
-
-    known_matrix = np.vstack(known_embs)
-    _save_embeddings_cache(cache_file, fingerprint, known_matrix, known_names)
-    print(f"Cached {len(known_names)} embeddings")
+    known_matrix = np.vstack(known_embs) if known_embs else np.empty((0, 0), dtype=np.float32)
+    np.savez_compressed(cache_file, cache_version=CACHE_VERSION, fingerprint=fingerprint, model_name=MODEL_NAME, embeddings=known_matrix, names=np.asarray(known_names, dtype=object))
     return known_matrix, known_names
 
+def _identify_face(cur_emb, known_embs, known_names):
+    """
+    Per-person nearest-neighbour identification.
 
-def _build_user_profiles(known_embs, known_names):
-    profiles = {}
-    for emb, name in zip(known_embs, known_names):
-        profiles.setdefault(name, []).append(emb)
+    For each registered person, take their MINIMUM cosine distance to the
+    query embedding (i.e. the closest sample they have, regardless of pose).
+    Then pick the person with the overall best match and require:
+      1. Their best distance is below SAMPLE_THRESHOLD.
+      2. The gap to the next-best person is above MARGIN_THRESHOLD.
 
-    out = {}
-    for name, embs in profiles.items():
-        mat = np.vstack(embs).astype(np.float32)
-        centroid = _l2_normalize(np.mean(mat, axis=0)).astype(np.float32)
-        out[name] = {
-            "embeddings": mat,
-            "centroid": centroid,
-        }
-    return out
+    This is the correct approach for a diverse-pose database: if a driver
+    is registered at 45-degree profile AND the query is also a 45-degree
+    profile, that registered sample will have a low distance even when all
+    frontal samples for the same person have high distances.  The old top-3
+    voting averaged those high-distance frontal samples in, causing Unknown.
+    """
+    dists = 1.0 - np.dot(known_embs, cur_emb)
 
+    # Per-person best (minimum) cosine distance
+    person_best: dict = {}
+    for name, dist in zip(known_names, dists):
+        d = float(dist)
+        if name not in person_best or d < person_best[name]:
+            person_best[name] = d
 
-def _identify_face(cur_emb, user_profiles, user_names, centroids):
-    centroid_dists = 1.0 - np.dot(centroids, cur_emb)
+    if not person_best:
+        return {"accepted": False, "name": "Unknown", "sample_dist": 1.0, "margin": 0.0}
 
-    best_idx = int(np.argmin(centroid_dists))
-    best_name = user_names[best_idx]
-    best_centroid_dist = float(centroid_dists[best_idx])
+    sorted_persons = sorted(person_best.items(), key=lambda x: x[1])
+    best_name, best_dist = sorted_persons[0]
+    next_best_dist = sorted_persons[1][1] if len(sorted_persons) > 1 else 1.0
+    margin = next_best_dist - best_dist
 
-    if len(user_names) > 1:
-        sorted_d = np.sort(centroid_dists)
-        margin = float(sorted_d[1] - sorted_d[0])
-    else:
-        margin = 1.0
-
-    best_user_embs = user_profiles[best_name]["embeddings"]
-    sample_dists = np.sort(1.0 - np.dot(best_user_embs, cur_emb))
-    top_k = min(3, len(sample_dists))
-    best_sample_dist = float(np.mean(sample_dists[:top_k]))
-
-    accepted = (
-        best_centroid_dist <= COSINE_THRESHOLD
-        and best_sample_dist <= SAMPLE_THRESHOLD
-        and margin >= MARGIN_THRESHOLD
-    )
-
-    return {
-        "accepted": accepted,
-        "name": best_name,
-        "centroid_dist": best_centroid_dist,
-        "sample_dist": best_sample_dist,
-        "margin": margin,
-    }
-
+    accepted = best_dist <= SAMPLE_THRESHOLD and margin >= MARGIN_THRESHOLD
+    return {"accepted": accepted, "name": best_name, "sample_dist": best_dist, "margin": margin}
 
 def _new_track(track_id, box):
     return {
         "id": track_id,
         "box": tuple(int(v) for v in box),
         "ttl": BOX_PERSIST_FRAMES,
+        "age_detections": 0,          # times matched to a real detection; suppresses phantom boxes
         "vote_history": deque(maxlen=VOTE_WINDOW),
-        "stable_name": None,
-        "stable_hold": 0,
+        "stable_name": None,          # None = Verifying, "Unknown" = confirmed stranger
+        "consecutive_unknown": 0,     # back-to-back Unknown results
         "verification_hint": "",
-        "last_recog_frame": -10**9,
+        "last_recog_frame": -10**9
     }
 
-
 def _update_track_vote(track, label):
+    """
+    Two-stage identity state machine:
+
+    GRANT  — a named person wins the vote window majority (>= VOTE_MIN_COUNT).
+             stable_name is set immediately.
+
+    REVOKE — REVOKE_UNKNOWN_COUNT consecutive Unknown results arrive.
+             Identity is wiped immediately (back to None / Verifying).
+             Vote history is also cleared so re-confirmation requires fresh evidence.
+             This means a different person walking into frame loses the old label
+             within ~0.5-1 second instead of dragging it for many seconds.
+
+    The old stable_hold countdown is removed — it caused identity to linger
+    long after a different face was clearly in frame.
+    """
     track["vote_history"].append(label)
     counts = Counter(track["vote_history"])
     top_label, top_count = counts.most_common(1)[0]
+
+    if label == "Unknown":
+        track["consecutive_unknown"] += 1
+    else:
+        track["consecutive_unknown"] = 0
+
+    # ── Consecutive-Unknown handler ────────────────────────────────────────
+    # REVOKE: only fires when a NAMED identity was already granted.
+    #   → wipes identity so a new face can earn its own label.
+    # CONFIRM-UNKNOWN: fires when the track is still Verifying (stable_name=None)
+    #   → marks them Unknown immediately instead of looping forever.
+    # If already "Unknown", consecutive hits have no extra effect.
+    if track["consecutive_unknown"] >= REVOKE_UNKNOWN_COUNT:
+        if track["stable_name"] is not None and track["stable_name"] != "Unknown":
+            # A recognised person has stopped matching → revoke and let re-verify
+            track["stable_name"] = None
+            track["vote_history"].clear()
+            track["consecutive_unknown"] = 0
+        elif track["stable_name"] is None:
+            # Unverified face keeps coming back Unknown → confirm as Unknown now
+            track["stable_name"] = "Unknown"
+        # If already "Unknown" — nothing to change
+        return
+
+    # Grant identity when vote majority reached
     if top_label != "Unknown" and top_count >= VOTE_MIN_COUNT:
         track["stable_name"] = top_label
-        track["stable_hold"] = BOX_PERSIST_FRAMES
     elif top_label == "Unknown" and top_count >= VOTE_MIN_COUNT:
-        if track["stable_hold"] > 0:
-            track["stable_hold"] -= 1
-        else:
-            track["stable_name"] = None
-    elif track["stable_hold"] > 0:
-        track["stable_hold"] -= 1
-
+        track["stable_name"] = "Unknown"
 
 def _match_faces_to_tracks(faces, tracks):
-    if not faces:
-        return {}, [], list(tracks.keys())
-    if not tracks:
-        return {}, list(faces), []
-
-    track_ids = list(tracks.keys())
+    if not faces: return {}, [], list(tracks.keys())
+    if not tracks: return {}, list(faces), []
+    
     pairs = []
-    for face_idx, face in enumerate(faces):
+    for f_idx, face in enumerate(faces):
         fcx, fcy = _box_center(face)
-        for track_id in track_ids:
-            tbox = tracks[track_id]["box"]
-            tcx, tcy = _box_center(tbox)
+        for tid, trk in tracks.items():
+            tbox = trk["box"]
             iou = _box_iou(face, tbox)
-            center_dist = float(np.hypot(fcx - tcx, fcy - tcy))
-            max_ref = max(1.0, TRACK_MAX_CENTER_DIST * float(max(tbox[2], tbox[3])))
-            close_enough = center_dist <= max_ref
-            if iou >= TRACK_MATCH_IOU or close_enough:
-                center_score = max(0.0, 1.0 - (center_dist / max_ref))
-                score = iou + (0.25 * center_score)
-                pairs.append((score, face_idx, track_id))
-
-    pairs.sort(key=lambda p: p[0], reverse=True)
-    assignments = {}
-    used_faces = set()
-    used_tracks = set()
-    for _, face_idx, track_id in pairs:
-        if face_idx in used_faces or track_id in used_tracks:
-            continue
-        assignments[track_id] = faces[face_idx]
-        used_faces.add(face_idx)
-        used_tracks.add(track_id)
-
-    unmatched_faces = [faces[i] for i in range(len(faces)) if i not in used_faces]
-    unmatched_tracks = [tid for tid in track_ids if tid not in used_tracks]
-    return assignments, unmatched_faces, unmatched_tracks
-
+            dist = np.hypot(fcx - _box_center(tbox)[0], fcy - _box_center(tbox)[1])
+            max_ref = max(1.0, TRACK_MAX_CENTER_DIST * max(tbox[2], tbox[3]))
+            if iou >= TRACK_MATCH_IOU or dist <= max_ref:
+                pairs.append((iou + 0.25 * max(0.0, 1.0 - dist / max_ref), f_idx, tid))
+    
+    assignments, used_faces, used_tracks = {}, set(), set()
+    for _, f_idx, tid in sorted(pairs, key=lambda p: p[0], reverse=True):
+        if f_idx not in used_faces and tid not in used_tracks:
+            assignments[tid] = faces[f_idx]
+            used_faces.add(f_idx); used_tracks.add(tid)
+            
+    return assignments, [f for i, f in enumerate(faces) if i not in used_faces], [t for t in tracks if t not in used_tracks]
 
 def _select_tracks_for_recognition(tracks, frame_count):
     candidates = []
     for track in tracks.values():
-        if frame_count - track["last_recog_frame"] < RECOGNIZE_EVERY_N_FRAMES:
-            continue
-        x, y, w, h = track["box"]
-        area = float(max(1, w * h))
-        staleness = float(frame_count - track["last_recog_frame"])
-        priority = area + (1000.0 * staleness)
-        candidates.append((priority, track))
+        is_known = track["stable_name"] is not None and track["stable_name"] != "Unknown"
+        required_wait = RECOGNIZE_EVERY_N_FRAMES * 5 if is_known else RECOGNIZE_EVERY_N_FRAMES
+        frames_since = frame_count - track["last_recog_frame"]
+        
+        if frames_since < required_wait: continue
+            
+        candidates.append((float(max(1, track["box"][2] * track["box"][3])) + (1000.0 * frames_since), track))
 
     candidates.sort(key=lambda t: t[0], reverse=True)
-    limit = max(1, MAX_RECOGNITIONS_PER_CYCLE)
-    return [track for _, track in candidates[:limit]]
-
+    return [track for _, track in candidates[:max(1, MAX_RECOGNITIONS_PER_CYCLE)]]
 
 def run_recognition():
-    database_dir = "database"
-    known_embs, known_names = _build_known_embeddings(database_dir)
-    if len(known_names) == 0:
-        print("No registered users found. Register at least one user first.")
-        return
+    known_embs, known_names = _build_known_embeddings("database")
+    if len(known_names) == 0: return print("No registered users found. Register first.")
+    if isinstance(known_names, np.ndarray): known_names = known_names.tolist()
 
-    user_profiles = _build_user_profiles(known_embs, known_names)
-    user_names = list(user_profiles.keys())
-    centroids = np.vstack([user_profiles[n]["centroid"] for n in user_names])
-
-    frontal_detector = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    profile_detector = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_profileface.xml"
-    )
+    frontal_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    profile_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+    alt_detectors = [
+        cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_alt.xml"),
+        cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"),
+    ]
     DeepFace = None
 
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    frame_count = 0
-    next_track_id = 1
-    last_logged = {}
-    tracks = {}
+    frame_count, next_track_id, tracks, last_logged = 0, 1, {}, {}
 
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
 
-        h, w, _ = frame.shape
-        if w > PROCESS_WIDTH:
-            scale = PROCESS_WIDTH / float(w)
-            small_frame = cv2.resize(
-                frame,
-                (PROCESS_WIDTH, int(h * scale)),
-                interpolation=cv2.INTER_AREA,
-            )
-            resize_ratio = w / float(PROCESS_WIDTH)
-        else:
-            small_frame = frame
-            resize_ratio = 1.0
+        frame = cv2.flip(frame, 1)  # mirror to match registered (mirrored) samples
+
+        scale = PROCESS_WIDTH / float(frame.shape[1]) if frame.shape[1] > PROCESS_WIDTH else 1.0
+        small_frame = cv2.resize(frame, (PROCESS_WIDTH, int(frame.shape[0] * scale)), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame
+        resize_ratio = 1.0 / scale if scale < 1.0 else 1.0
 
         if frame_count % DETECT_EVERY_N_FRAMES == 0:
             gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-            faces = _detect_faces_multi_pose(gray, frontal_detector, profile_detector)
-            if len(faces) == 0 and frame_count % FALLBACK_DETECT_EVERY_N_FRAMES == 0:
-                if DeepFace is None:
-                    DeepFace = _load_deepface()
-                faces = _detect_faces_fallback(DeepFace, small_frame)
-
-            if faces:
-                faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-                faces = faces[: max(1, MAX_FACES_PER_FRAME)]
-
+            faces = _detect_faces_multi_pose(gray, frontal_detector, profile_detector, alt_detectors)
+            faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[:max(1, MAX_FACES_PER_FRAME)]
             assignments, unmatched_faces, unmatched_tracks = _match_faces_to_tracks(faces, tracks)
 
-            for track_id, new_box in assignments.items():
-                track = tracks[track_id]
-                track["box"] = _smooth_box(track["box"], new_box, BOX_SMOOTHING_ALPHA)
-                track["ttl"] = BOX_PERSIST_FRAMES
+            for tid, new_box in assignments.items():
+                tracks[tid]["box"] = _smooth_box(tracks[tid]["box"], new_box, BOX_SMOOTHING_ALPHA)
+                tracks[tid]["ttl"] = BOX_PERSIST_FRAMES
+                tracks[tid]["age_detections"] += 1  # confirmed by a real detection this cycle
 
-            for track_id in unmatched_tracks:
-                track = tracks.get(track_id)
-                if track is not None:
-                    track["ttl"] -= 1
-
+            for tid in unmatched_tracks: tracks[tid]["ttl"] -= 1
             for new_box in unmatched_faces:
-                if len(tracks) >= max(1, MAX_ACTIVE_TRACKS):
-                    break
-                tracks[next_track_id] = _new_track(next_track_id, new_box)
-                next_track_id += 1
+                if len(tracks) < max(1, MAX_ACTIVE_TRACKS):
+                    tracks[next_track_id] = _new_track(next_track_id, new_box)
+                    next_track_id += 1
+            
+            tracks = {tid: t for tid, t in tracks.items() if t["ttl"] > 0}
 
-            expired_ids = [tid for tid, track in tracks.items() if track["ttl"] <= 0]
-            for tid in expired_ids:
-                tracks.pop(tid, None)
-
-        if tracks and frame_count % RECOGNIZE_EVERY_N_FRAMES == 0:
-            candidates = _select_tracks_for_recognition(tracks, frame_count)
-            if candidates and DeepFace is None:
-                DeepFace = _load_deepface()
-
-            for track in candidates:
-                x, y, fw, fh = track["box"]
+        if tracks:
+            for track in _select_tracks_for_recognition(tracks, frame_count):
+                if DeepFace is None: DeepFace = _load_deepface()
                 track["last_recog_frame"] = frame_count
-
-                if fw < MIN_QUERY_FACE or fh < MIN_QUERY_FACE:
+                x, y, fw, fh = track["box"]
+                
+                if fw < MIN_QUERY_FACE or fh < MIN_QUERY_FACE: 
                     track["verification_hint"] = "Face too small"
-                    _update_track_vote(track, "Unknown")
                     continue
 
-                x = max(0, x)
-                y = max(0, y)
-                x2 = min(small_frame.shape[1], x + fw)
-                y2 = min(small_frame.shape[0], y + fh)
-                face_crop = small_frame[y:y2, x:x2]
+                face_crop = small_frame[max(0, y):min(small_frame.shape[0], y + fh), max(0, x):min(small_frame.shape[1], x + fw)]
+                if face_crop.size == 0: continue
 
-                if face_crop.size == 0:
-                    _update_track_vote(track, "Unknown")
-                    continue
-
-                sharpness, brightness, is_good_quality = _face_quality(face_crop)
-                if not is_good_quality:
+                sharpness, brightness, is_good = _face_quality(face_crop)
+                if not is_good: 
                     track["verification_hint"] = f"Low quality s={sharpness:.0f} b={brightness:.0f}"
-                    _update_track_vote(track, "Unknown")
                     continue
+
+                # Normalize to 112x112 with CLAHE — identical preprocessing to registration.
+                # This is what makes close and far faces produce the same embedding space.
+                face_norm = _prepare_face_for_embedding(face_crop)
 
                 try:
-                    reps = DeepFace.represent(
-                        face_crop,
-                        model_name=MODEL_NAME,
-                        detector_backend=REPRESENT_BACKEND,
-                        enforce_detection=False,
-                    )
-                    if not reps:
-                        _update_track_vote(track, "Unknown")
-                        continue
-
-                    cur_e = np.asarray(reps[0]["embedding"], dtype=np.float32)
-                    cur_e = _l2_normalize(cur_e).astype(np.float32)
-                    match = _identify_face(cur_e, user_profiles, user_names, centroids)
-                    if match["accepted"]:
-                        _update_track_vote(track, match["name"])
-                        track["verification_hint"] = f"{match['name']} d={match['sample_dist']:.3f}"
-                    else:
-                        _update_track_vote(track, "Unknown")
-                        track["verification_hint"] = (
-                            f"Unknown d={match['sample_dist']:.3f} m={match['margin']:.3f}"
-                        )
-                except Exception:
+                    # TTA: average embeddings across brightness variants for robustness
+                    cur_e = _get_robust_embedding(face_norm, DeepFace)
+                    if cur_e is not None:
+                        match = _identify_face(cur_e, known_embs, known_names)
+                        
+                        if match["accepted"]:
+                            _update_track_vote(track, match["name"])
+                            track["verification_hint"] = f"{match['name']} d={match['sample_dist']:.2f}"
+                        else:
+                            _update_track_vote(track, "Unknown")
+                            track["verification_hint"] = f"Unknown d={match['sample_dist']:.2f} m={match['margin']:.2f}"
+                except Exception: 
                     track["verification_hint"] = "Embedding failed"
-                    _update_track_vote(track, "Unknown")
 
         recognized_now = 0
-        for track_id in sorted(tracks.keys()):
-            track = tracks[track_id]
+        for track_id, track in tracks.items():
+            # Suppress phantom boxes: don't render until the track has been confirmed
+            # by at least MIN_DETECT_AGE real detection cycles. One-frame Haar false
+            # positives die out before reaching this threshold.
+            if track["age_detections"] < MIN_DETECT_AGE and track["stable_name"] is None:
+                continue
+
             x, y, fw, fh = track["box"]
-            x1 = int(x * resize_ratio)
-            y1 = int(y * resize_ratio)
-            x2 = int((x + fw) * resize_ratio)
-            y2 = int((y + fh) * resize_ratio)
+            x1 = max(0, min(frame.shape[1] - 1, int(x * resize_ratio)))
+            y1 = max(0, min(frame.shape[0] - 1, int(y * resize_ratio)))
+            x2 = max(0, min(frame.shape[1] - 1, int((x + fw) * resize_ratio)))
+            y2 = max(0, min(frame.shape[0] - 1, int((y + fh) * resize_ratio)))
 
-            x1 = max(0, min(frame.shape[1] - 1, x1))
-            y1 = max(0, min(frame.shape[0] - 1, y1))
-            x2 = max(0, min(frame.shape[1] - 1, x2))
-            y2 = max(0, min(frame.shape[0] - 1, y2))
-
-            if track["stable_name"] is not None:
+            if track["stable_name"] is not None and track["stable_name"] != "Unknown":
                 recognized_now += 1
                 color = (0, 220, 0)
-                label = f"{track['stable_name']} (T{track_id})"
+                pid = get_persistent_id(track["stable_name"])
+                label = f"{track['stable_name']} (ID:{pid})"
+                
                 now = time.time()
                 if now - last_logged.get(track["stable_name"], 0) >= ATTENDANCE_COOLDOWN_SECS:
                     log_attendance(track["stable_name"])
                     last_logged[track["stable_name"]] = now
+            elif track["stable_name"] == "Unknown":
+                color = (0, 0, 255) 
+                label = f"Unknown (Trk:{track_id})"
             else:
                 color = (0, 180, 255)
-                label = f"T{track_id} Verifying"
+                label = f"Verifying (Trk:{track_id})"
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                frame,
-                label,
-                (x1, max(25, y1 - 12)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
-                color,
-                2,
-            )
-
+            cv2.putText(frame, label, (x1, max(25, y1 - 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2)
+            
             if track["verification_hint"]:
-                cv2.putText(
-                    frame,
-                    track["verification_hint"],
-                    (x1, min(frame.shape[0] - 8, y2 + 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.48,
-                    (255, 255, 0),
-                    1,
-                )
+                cv2.putText(frame, track["verification_hint"], (x1, min(frame.shape[0] - 8, y2 + 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 0), 1)
 
         if not tracks:
-            cv2.putText(
-                frame,
-                "No face detected",
-                (12, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 180, 255),
-                2,
-            )
+            cv2.putText(frame, "No face detected", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 180, 255), 2)
 
-        cv2.putText(
-            frame,
-            f"tracks:{len(tracks)} known:{recognized_now} detect:{DETECT_EVERY_N_FRAMES} recog:{RECOGNIZE_EVERY_N_FRAMES}",
-            (12, frame.shape[0] - 14),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (220, 220, 220),
-            1,
-        )
-
+        cv2.putText(frame, f"Driver Tracking Mode | Tracks:{len(tracks)} Known:{recognized_now}", (12, frame.shape[0] - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
         cv2.imshow("Fast Attendance", frame)
         frame_count += 1
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        if cv2.waitKey(1) & 0xFF == ord("q"): break
 
     cap.release()
     cv2.destroyAllWindows()
